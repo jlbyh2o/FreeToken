@@ -47,6 +47,33 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.5 NVFP4 experts",
 )
+# The same experts from an llm-compressor export: identical key prefixes, different kind
+# names. ``weight_global_scale`` is the QUANT-side global (448*6/amax), so it is inverted at
+# ingest. ``input_global_scale`` deliberately does not match: this path is W4A16 and never
+# quantizes activations.
+_NVFP4_CT_EXPERT_KEY_RE = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight_packed|weight_global_scale|weight_scale)$"
+)
+_NVFP4_CT_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_NVFP4_CT_EXPERT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+    desc="Qwen3.5 NVFP4 experts (compressed-tensors)",
+    kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
+    global_reciprocal=True,
+)
+
+
+def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
+    """Pick the expert source spec by export tooling. Gated on the same detector that made
+    ``expert_quant`` nvfp4 in config.py, so detection and tensor-kind naming cannot disagree."""
+    if _compressed_tensors_nvfp4(cached_load_hf_config(model_path)):
+        return _NVFP4_CT_SOURCE_SPEC
+    return _NVFP4_SOURCE_SPEC
+
+
 # Suffixes of the per-tensor modelopt quant scales; consumed alongside their ``.weight``,
 # never yielded on their own.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
@@ -180,12 +207,13 @@ def iter_weights(
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
     if _compressed_tensors_nvfp4(hf_config):
-        # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
-        # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
+        # compressed-tensors NVFP4: attn q/k/v/o and the dense MLP (bare ``.mlp.`` when dense,
+        # ``.mlp.shared_expert.`` when MoE) are W4A16 NVFP4; in_proj_*, lm_head, norms bf16.
+        # Routed experts, if any, are excluded here and served from the offload cache.
         yield from _iter_weights_compressed_tensors(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
-            nvfp4=config.dense_quant == "nvfp4",
+            nvfp4=config.dense_quant == "nvfp4", moe=config.moe_enabled,
         )
         return
     if config.expert_quant == "fp8_block":
@@ -532,17 +560,24 @@ def _iter_weights_attn_fp8(
 
 
 # ======================================================================================
-# compressed-tensors NVFP4 checkpoint (dense Qwen3.x, e.g. Qwen3.6-27B)
+# compressed-tensors NVFP4 checkpoint (dense Qwen3.x e.g. Qwen3.6-27B; MoE e.g. Qwen3.5-MoE)
 # ======================================================================================
 # NVFP4 (W4A16) targets every Linear except the per-module ``ignore`` list (lm_head, GDN
-# in_proj_*, vision, mtp). Storage differs from modelopt: ``weight_packed`` (uint8 [O, IN//2])
+# in_proj_*, vision, mtp -- and, on some exports, the whole GDN block including out_proj;
+# see config.py::_ct_linear_attn_quant). Storage differs from modelopt: ``weight_packed`` (uint8 [O, IN//2])
 # + ``weight_scale`` (fp8-e4m3 block [O, IN//16]) + a scalar ``weight_global_scale``. The
 # stored global is the *quant-side* scale, so the dequant/native global is its reciprocal
 # (``1/weight_global_scale``) -- vLLM inverts it identically. Dense MLP gate/up and attention
 # q/k/v fuse on the output dim into ``gate_up_proj`` / ``qkv_proj`` (each part keeps its own
 # global, so the fused FP4 weight is exact). GDN ``in_proj_{qkv,z,b,a}`` stay bf16 -> ``in_proj``.
+# The dense MLP sits under ``.mlp.shared_expert.`` on a MoE checkpoint and a bare ``.mlp.``
+# on a dense one, so both are listed (as _NVFP4_MLP_LAYOUTS does for modelopt). They cannot
+# collide: ``.mlp.shared_expert.gate_proj`` does not end with ``.mlp.gate_proj``.
 _CT_NVFP4_FUSE: dict[str, tuple[str, ...]] = {
     ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
+    ".mlp.shared_expert.gate_up_proj": (
+        ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj",
+    ),
     ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
 }
 _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
@@ -564,20 +599,31 @@ def _ct_nvfp4_fuse(base: str, parts_tuple: tuple, buf: dict):
 
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    nvfp4: bool,
+    nvfp4: bool, moe: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Dense pass for a compressed-tensors NVFP4 checkpoint (e.g. Qwen3.6-27B).
+    """Dense pass for a compressed-tensors NVFP4 checkpoint (dense Qwen3.6-27B; MoE
+    Qwen3.5-MoE/Qwen3.6-MoE).
 
-    Keeps the NVFP4 attention (q/k/v/o, GDN out_proj) and dense MLP (gate/up/down) native
+    Keeps the NVFP4 attention and dense MLP (gate/up/down) native
     (W4A16) -- ``.weight`` (uint8) + ``.weight_scale`` (fp8 block) + ``.weight_global`` (fp16
     per-row) -- when ``nvfp4``; otherwise dequantizes each to bf16. q/k/v -> ``qkv_proj``, dense gate/up -> ``gate_up_proj`` (output-dim concat).
-    GDN ``in_proj_{qkv,z,b,a}`` stay bf16 -> fused ``in_proj``; ``conv1d``/``A_log``/``dt_bias``/
-    gated ``norm`` pass through (fp32 for A_log/dt_bias). Gemma (1+w) norms get +1. lm_head and
-    embeddings are bf16. The model is dense (no routed experts), so there is no experts pass."""
+    GDN ``in_proj_{qkv,z,b,a}`` stay bf16 -> fused ``in_proj``; ``out_proj`` follows whatever
+    the checkpoint stored; ``conv1d``/``A_log``/``dt_bias``/gated ``norm`` pass through (fp32
+    for A_log/dt_bias). Gemma (1+w) norms get +1. lm_head and embeddings are bf16.
+
+    ``moe``: the checkpoint has routed experts. They are packed per-expert and un-fused, so
+    they are skipped here and served from the offload cache; the resident path wants the
+    pre-fused ``experts.gate_up_proj``/``down_proj`` layout this export does not store."""
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe weight loading currently supports TP=1 only")
+    if moe and include_moe_experts:
+        raise ValueError(
+            "compressed-tensors NVFP4 routed experts are stored per-expert and un-fused, so "
+            "they are served from the offload cache; run with --moe-backend offload (or "
+            "hybrid/cpu), not fused."
+        )
     if not include_non_moe:
-        return  # dense checkpoint: no routed experts to load
+        return  # routed experts (if any) come from the offload cache, not this pass
 
     tp_info = get_tp_info()
     nvfp4_buf: dict[str, dict[int, tuple]] = {}
@@ -607,6 +653,8 @@ def _iter_weights_compressed_tensors(
             for raw_name in reader.names_in(file):
                 if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
                     continue
+                if _NVFP4_EXPERT_RE.search(raw_name):
+                    continue  # routed experts -> offload cache
                 if raw_name.endswith(_CT_SCALE_SUFFIXES):
                     continue  # consumed with weight_packed (or unused W4A4 activation scales)
 
@@ -1068,7 +1116,7 @@ def load_nvfp4_expert_sources(
     return load_nvfp4_expert_source_banks(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        _select_expert_source_spec(model_path),
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
@@ -1084,7 +1132,7 @@ def load_nvfp4_expert_sources_parallel(
     return load_nvfp4_expert_source_banks_parallel(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        _select_expert_source_spec(model_path),
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         workers=workers,

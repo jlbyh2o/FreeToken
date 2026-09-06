@@ -277,6 +277,12 @@ class ModelConfig:
     # scale and runs a W8A16 kernel (modelopt MIXED_PRECISION); "none" leaves them bf16
     # (dequant-at-load for any other dense quant, e.g. NVFP4 shared_expert/lm_head).
     attn_quant: str = "none"
+    # Weight quantization of the GatedDeltaNet (linear-attention) projections, when it differs
+    # from ``attn_quant``. compressed-tensors exports disagree about them: Qwen3.6-27B leaves
+    # only ``in_proj_*`` in its ``ignore`` list and stores the GDN ``out_proj`` as packed FP4,
+    # while an export that ignores the whole linear_attn block stores every GDN projection as
+    # plain bf16. ``None`` means "follow attn_quant".
+    linear_attn_quant: str | None = None
     # Weight quantization of the *dense* NVFP4 MLP projections -- the shared expert, and dense
     # (non-MoE) MLP layers -- which NVFP4 checkpoints store as packed FP4 like the routed
     # experts. "nvfp4" keeps them packed and runs the W4A16 dense kernels (quartering their

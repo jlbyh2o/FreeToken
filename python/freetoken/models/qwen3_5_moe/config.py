@@ -20,6 +20,13 @@ def _quant_accessor(hf_config: Any):
     return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
 
 
+def _has_routed_experts(hf_config: Any) -> bool:
+    """Whether the checkpoint is MoE. Mirrors parse_config's ``num_experts`` read (the
+    multimodal wrapper keeps the text model under ``text_config``)."""
+    text = getattr(hf_config, "text_config", hf_config)
+    return int(getattr(text, "num_experts", 0) or 0) > 0
+
+
 def _fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
     """Detect DeepSeek-V3-style 128x128 block-fp8 from HF ``quantization_config``.
 
@@ -43,7 +50,9 @@ def _expert_quant(hf_config: Any) -> str:
     """Quantization format of the *routed* experts (the only weights served from the
     offload cache). The nvidia/modelopt checkpoints are either plain NVFP4 (``quant_algo``
     ``NVFP4``) or ``MIXED_PRECISION`` (per-layer ``quantized_layers`` map); in the mixed
-    case the routed experts carry their own ``W4A16_NVFP4``/``FP8`` algo. Dense quantized
+    case the routed experts carry their own ``W4A16_NVFP4``/``FP8`` algo. An llm-compressor
+    export instead declares ``quant_method`` "compressed-tensors" and describes the NVFP4
+    geometry in ``config_groups`` -- detected last, via the shared detector. Dense quantized
     weights (attention/shared-expert/lm_head) are handled separately by dequant-at-load."""
     get = _quant_accessor(hf_config)
     if get is None:
@@ -60,6 +69,11 @@ def _expert_quant(hf_config: Any) -> str:
                     return "nvfp4"
                 if "fp8" in expert_algo:
                     return "fp8"
+    # llm-compressor names the tooling in ``quant_method`` and hides the FP4 geometry in
+    # ``config_groups``, so neither branch above fires. A dense export has no routed experts
+    # to describe and stays "none" (its packed FP4 is ``dense_quant``'s business).
+    if detect_compressed_tensors_nvfp4(hf_config) and _has_routed_experts(hf_config):
+        return "nvfp4"
     return "none"
 
 
@@ -101,6 +115,32 @@ def _dense_mlp_quant(hf_config: Any) -> str:
         if name.endswith((".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj")):
             if "fp4" in str((spec or {}).get("quant_algo", "")).lower():
                 return "nvfp4"
+    return "none"
+
+
+def _ct_linear_attn_quant(hf_config: Any) -> str:
+    """NVFP4 verdict for the GatedDeltaNet ``out_proj`` in a compressed-tensors export.
+
+    Qwen3.6-27B ignores only ``in_proj_*`` and packs ``out_proj`` as FP4; an export that
+    ignores the whole linear_attn block stores it bf16. ``out_proj`` is the only GDN
+    projection the model ever builds quantized, so the ignore list's entry for it decides."""
+    get = _quant_accessor(hf_config)
+    ignore = (get("ignore") if get else None) or []
+    if not isinstance(ignore, (list, tuple)):
+        return "nvfp4"
+    ignored = sum(1 for m in ignore if str(m).endswith(".linear_attn.out_proj"))
+    if ignored == 0:
+        return "nvfp4"
+    text = getattr(hf_config, "text_config", hf_config)
+    linear_layers = sum(1 for t in _layer_types(text) if t == "linear_attention")
+    # Every GDN layer is built from the same verdict, so a half-quantized export would load
+    # garbage into whichever half disagrees; say so instead.
+    if ignored != linear_layers:
+        raise ValueError(
+            f"compressed-tensors export ignores linear_attn.out_proj on {ignored} of "
+            f"{linear_layers} linear-attention layers; FreeToken builds every GDN layer with "
+            "the same quantization and cannot serve a partially quantized one"
+        )
     return "none"
 
 
@@ -179,13 +219,17 @@ def parse_config(hf_config: Any) -> ModelConfig:
     dense_quant = "nvfp4" if expert_quant == "nvfp4" else _dense_mlp_quant(hf_config)
     lm_head_quant = _lm_head_quant(hf_config)
 
-    # compressed-tensors NVFP4 (dense Qwen3.6-27B): the attention (q/k/v/o, GDN out_proj) AND
-    # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
-    # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
+    # compressed-tensors NVFP4: the attention (q/k/v/o) and the dense MLP are W4A16 NVFP4;
+    # in_proj_*, lm_head, norms stay bf16. Wire the shared W4A16 kernels (attn_quant=="nvfp4"
+    # routes the attention/GDN linears through them too).
+    linear_attn_quant = None
     if _compressed_tensors_nvfp4(hf_config):
         attn_quant = "nvfp4"
         dense_quant = "nvfp4"
         lm_head_quant = "none"
+        # The GDN out_proj is the one linear these exports disagree about, so it is read
+        # from the checkpoint's own ignore list rather than assumed to follow attn_quant.
+        linear_attn_quant = _ct_linear_attn_quant(hf_config)
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
     # the dense Qwen3_5DenseMLP instead of the MoE block.
@@ -255,6 +299,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
         attn_quant=attn_quant,
+        linear_attn_quant=linear_attn_quant,
         dense_quant=dense_quant,
         lm_head_quant=lm_head_quant,
     )
