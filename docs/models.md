@@ -19,6 +19,7 @@ for them; other checkpoints of the same architectures work too.
 | MiniMax-M2.5 | [nvidia/MiniMax-M2.5-NVFP4](https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4) |
 | MiniMax-M3 | [nvidia/MiniMax-M3-NVFP4](https://huggingface.co/nvidia/MiniMax-M3-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
+| K2-Horizon-MoVA | [IFM/K2-Horizon-MoVA-36B-A4B](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B) (bf16; an NVFP4 build of it needs the value-experts quantized, see below) |
 
 ### Image input
 
@@ -57,3 +58,9 @@ These families accept image input by default; pass `--text-model-only` to skip t
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- K2-Horizon-MoVA routes its value projection over 64 value-experts per sparse layer
+  (MoVA). Those stay GPU-resident rather than going to the offload cache, so the
+  checkpoint must quantize them: in bf16 they are 14 GiB and the resident footprint
+  exceeds 16 GB before any KV cache, while as NVFP4 they are 4 GiB. Releases that
+  quantize only the routed MLP experts (leaving `self_attn.v_experts.*` in bf16) load
+  but need roughly 20 GiB of VRAM for weights alone.

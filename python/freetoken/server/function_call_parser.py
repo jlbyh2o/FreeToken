@@ -79,6 +79,7 @@ TOOLS_TAG_LIST = [
     "<｜DSML｜tool_calls>",
     "<｜DSML｜invoke",
     "<atem:function_calls>",
+    "<ifm|tool_calls>",
 ]
 
 
@@ -2048,6 +2049,104 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
 
+class K2HorizonDetector(InvokeParamStreamMixin, BaseFormatDetector):
+    toolcall_opener = "<ifm|tool_calls>"
+    _ps_trim = "\n"
+    _ps_trim_single = True
+    _ps_missing_type = "string"
+
+    """
+    Detector for K2-Horizon's XML tool-call format.
+
+    Format Structure:
+    ```
+    <ifm|tool_calls>
+    <ifm|tool_call>function_name
+    <ifm|arg_key>param1</ifm|arg_key>
+    <ifm|arg_value>value1</ifm|arg_value>
+    </ifm|tool_call>
+    </ifm|tool_calls>
+    ```
+
+    The function name sits on the rest of the opening line rather than in a tag
+    attribute, and a key/value pair spans two tags instead of one. ``xml_typed`` adds an
+    ``<ifm|arg_type>`` tag between them, which the parameter pattern skips -- the schema
+    already gives the type, so the model's claim about it is not needed.
+
+    The template's ``json`` tool_call_format is a different grammar (one JSON object per
+    ``<ifm|tool_call>``) and is not parsed here; the template defaults to ``xml``.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<ifm|tool_calls>"
+        self.eot_token = "</ifm|tool_calls>"
+        self.tool_call_separator = "\n"
+
+        self.tool_call_block_regex = re.compile(
+            r"<ifm\|tool_call>(.*?)(?:</ifm\|tool_call>|$)", re.DOTALL
+        )
+        self.parameter_regex = re.compile(
+            r"<ifm\|arg_key>(.*?)</ifm\|arg_key>\s*"
+            r"(?:<ifm\|arg_type>.*?</ifm\|arg_type>\s*)?"
+            r"<ifm\|arg_value>(.*?)(?:</ifm\|arg_value>|$)",
+            re.DOTALL,
+        )
+
+        # InvokeParamStreamMixin grammar
+        self._ps_outer_open = "<ifm|tool_calls>"
+        self._ps_outer_close = "</ifm|tool_calls>"
+        self._ps_invoke_open_prefix = "<ifm|tool_call>"
+        self._ps_invoke_open_re = re.compile(r"<ifm\|tool_call>([^\n<]*)\n")
+        self._ps_invoke_close = "</ifm|tool_call>"
+        self._ps_param_open_prefix = "<ifm|arg_key>"
+        self._ps_param_open_re = re.compile(
+            r"<ifm\|arg_key>(.*?)</ifm\|arg_key>\s*"
+            r"(?:<ifm\|arg_type>.*?</ifm\|arg_type>\s*)?"
+            r"<ifm\|arg_value>",
+            re.DOTALL,
+        )
+        self._ps_param_close = "</ifm|arg_value>"
+        self._ps_reset()
+
+    def has_tool_call(self, text: str) -> bool:
+        return self.bot_token in text
+
+    def _parse_one_call(self, body: str, tools: List[Tool]) -> Optional[ToolCallItem]:
+        name, _, rest = body.partition("\n")
+        func_name = name.strip()
+        tool_indices = self._get_tool_indices(tools)
+        if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+            logger.warning(f"Model attempted to call undefined function: {func_name}")
+            return None
+
+        param_config = self._get_param_config(func_name, tools)
+        params = {
+            key.strip(): self._convert_param_value(
+                self._ps_trim_trailing(self._ps_trim_leading(value)), key.strip(), param_config, func_name
+            )
+            for key, value in self.parameter_regex.findall(rest)
+        }
+        return ToolCallItem(
+            tool_index=tool_indices.get(func_name, 0),
+            name=func_name,
+            parameters=json.dumps(params, ensure_ascii=False),
+        )
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        idx = text.find(self.bot_token)
+        if idx == -1:
+            return StreamingParseResult(normal_text=text, calls=[])
+
+        calls: List[ToolCallItem] = []
+        for body in self.tool_call_block_regex.findall(text[idx:]):
+            item = self._parse_one_call(body, tools)
+            if item:
+                item.tool_index = len(calls)
+                calls.append(item)
+        return StreamingParseResult(normal_text=text[:idx].strip(), calls=calls)
+
+
 class Gemma4Detector(BaseFormatDetector):
     """FreeToken serving adapter for Gemma4's compact tool-call format."""
     toolcall_opener = "<|tool_call>"
@@ -3527,6 +3626,7 @@ class FunctionCallParser:
         "gpt-oss": GptOssDetector,
         "gpt_oss": GptOssDetector,
         "glm47": Glm47Detector,
+        "k2_horizon": K2HorizonDetector,
         "llama3": Llama32Detector,
         "minimax": MiniMaxDetector,
         "minimax_m3": MiniMaxM3Detector,

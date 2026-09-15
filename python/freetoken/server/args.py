@@ -193,6 +193,8 @@ def parse_args(
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
+        if "k2_horizon" in marker or "k2horizon" in marker or "k2-horizon" in marker:
+            return "k2_horizon"
         if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
             return "qwen3_coder"
         if (
@@ -252,6 +254,8 @@ def parse_args(
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
+        if "k2_horizon" in marker or "k2horizon" in marker or "k2-horizon" in marker:
+            return "k2_horizon"
         return None
 
     parser = argparse.ArgumentParser(prog=prog, description="FreeToken Server Arguments")
@@ -561,6 +565,7 @@ def parse_args(
             "minimax",
             "minimax_m3",
             "muse_glimmer",
+            "k2_horizon",
             "gpt_oss",
             "gpt-oss",
         ],
@@ -573,7 +578,7 @@ def parse_args(
         default="auto",
         choices=[
             "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
-            "minimax", "minimax_m3", "muse_glimmer", "gemma4",
+            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "k2_horizon",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "

@@ -193,6 +193,47 @@ class GatedRMSNorm(BaseOP):
         )
 
 
+class GroupedRMSNormFused(BaseOP):
+    """RMSNormFused that normalizes ``n_groups`` slices of the row independently.
+
+    K2-Horizon's pre-sublayer norms take the variance over each half of the hidden state
+    rather than the whole row, then apply one full-width scale. Splitting the row into
+    ``[-1, group]`` makes that the ordinary kernel over a taller matrix, so the scale has
+    to come off the kernel (a ones vector) and be applied afterwards.
+    """
+
+    def __init__(self, size: int, eps: float, n_groups: int) -> None:
+        from freetoken.kernel.backend import is_flashinfer_installed
+
+        if is_flashinfer_installed():
+            from flashinfer import rmsnorm
+        else:
+            from freetoken.kernel.triton.norm import rmsnorm
+
+        assert size % n_groups == 0, f"hidden size {size} is not divisible by {n_groups} groups"
+        self.eps = eps
+        self.n_groups = n_groups
+        self.group_size = size // n_groups
+        self.weight = torch.empty(size)
+        self.rmsnorm = rmsnorm
+        self._ones: torch.Tensor | None = None
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        if self._ones is None:
+            self._ones = torch.ones(self.group_size, device=x.device, dtype=x.dtype)
+        out = self.rmsnorm(x.contiguous().view(-1, self.group_size), self._ones, self.eps)
+        return out.view_as(x) * self.weight
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return self._norm(x), x
+        # Same contract as RMSNormFused: the residual absorbs x, then gets normalized.
+        residual.add_(x)
+        return self._norm(residual), residual
+
+
 class LayerNorm(BaseOP):
     """LayerNorm with bias on torch's fused kernel; the decoders use the RMSNorm family."""
 

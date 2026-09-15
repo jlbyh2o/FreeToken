@@ -323,6 +323,17 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         arch_aliases=("MiniMaxM3SparseForCausalLM",),
     ),
     AotModel(
+        # MoVA's value-experts are resident, not offload banks, so only the routed
+        # MLP experts shape the expert kernels here.
+        name="IFM/K2-Horizon-MoVA-36B-A4B",
+        architecture="K2HorizonForCausalLM",
+        hidden_size=2560,
+        kv_groups=((8, 128),),
+        top_k=8,
+        moe_intermediate_size=768,
+        expert_formats=("bf16", "nvfp4"),
+    ),
+    AotModel(
         name="deepseek-ai/DeepSeek-V4-Flash",
         architecture="DeepseekV4ForCausalLM",
         hidden_size=4096,

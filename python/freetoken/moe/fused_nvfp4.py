@@ -329,8 +329,60 @@ def fused_experts_nvfp4(
     return out
 
 
+def fused_single_proj_nvfp4(
+    hidden_states: torch.Tensor,
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    glob: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    *,
+    is_prefill: bool,
+    activation: str = "silu",
+) -> torch.Tensor:
+    """Routed experts that are a single projection: ``sum_k w_k * act(W_[e_k] x)``.
+
+    K2-Horizon's MoVA value-experts have no gate/up pair and no second GEMM, so the
+    activation lands on the GEMM output and the routing weight cannot ride a second
+    GEMM's epilogue the way it does in :func:`fused_experts_nvfp4`. Everything else --
+    the bank layout, the inline dequant, the sum-reduce -- is the shared machinery.
+
+    Returns ``[M, N]`` where ``N`` is the experts' output width, which need not be the
+    hidden size.
+    """
+    assert activation == "silu", f"single-projection experts support silu only, got {activation!r}"
+    M = hidden_states.shape[0]
+    top_k = topk_ids.shape[1]
+    n = packed.shape[1]
+    dev, dt = hidden_states.device, hidden_states.dtype
+
+    routed = torch.empty((M, top_k, n), device=dev, dtype=dt)
+    if is_prefill:
+        cfg = _prefill_config(M)
+        sorted_ids, expert_ids, ntpp = moe_align_block_size(
+            topk_ids, cfg["BLOCK_SIZE_M"], num_experts
+        )
+        _prefill_gemm(
+            hidden_states, packed, scale, glob, routed,
+            topk_weights.reshape(-1).contiguous(), sorted_ids, expert_ids, ntpp,
+            topk_ids.numel(), top_k, False, cfg,
+        )
+    else:
+        _decode_gemm_marlin(
+            hidden_states, packed, scale, glob, routed, topk_weights, topk_ids, False, False
+        )
+
+    torch.nn.functional.silu(routed, inplace=True)
+    routed.mul_(topk_weights.unsqueeze(-1).to(dt))
+    out = torch.empty((M, n), device=dev, dtype=dt)
+    moe_sum_reduce_triton(routed, out)
+    return out
+
+
 __all__ = [
     "fused_experts_decode_nvfp4_marlin",
     "fused_experts_decode_nvfp4_serial",
     "fused_experts_nvfp4",
+    "fused_single_proj_nvfp4",
 ]

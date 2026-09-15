@@ -412,6 +412,58 @@ class ThinkReasoningParser(BaseReasoningParser):
         )
 
 
+class K2HorizonReasoningParser(BaseReasoningParser):
+    """Reasoning parser for K2-Horizon's ``<ifm|think>`` protocol.
+
+    The template always pre-opens a think tag in the generation prompt, so the model only
+    ever emits the closer -- but *which* closer depends on the request's
+    ``reasoning_effort``: high opens ``<ifm|think>``, medium ``<ifm|think_fast>``, low
+    ``<ifm|think_faster>``. The parser is built per request without that knob, so it
+    accepts all three and binds to whichever the generation actually uses. The three are
+    mutually non-prefix (each ends in ``>``), so the first one seen is unambiguous.
+    """
+
+    THINK_ENDS = ("</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>")
+    TOOL_START = "<ifm|tool_calls>"
+
+    def __init__(self, force_reasoning: bool = True, stream_reasoning: bool = True) -> None:
+        super().__init__(
+            think_start_token="<ifm|think>",
+            think_end_token=self.THINK_ENDS[0],
+            # The prompt always opens the block; the model never writes an opener.
+            force_reasoning=True,
+            stream_reasoning=stream_reasoning,
+            tool_start_token=self.TOOL_START,
+        )
+        self._stripped_think_start = True
+
+    def _bind_end_token(self, text: str) -> None:
+        seen = [(text.find(tok), tok) for tok in self.THINK_ENDS if tok in text]
+        if seen:
+            self.think_end_token = min(seen)[1]
+
+    def detect_and_parse(self, text: str) -> ReasoningParseResult:
+        self._bind_end_token(text)
+        return super().detect_and_parse(text)
+
+    def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        self._bind_end_token(self._buffer + new_text)
+        return super().parse_streaming_increment(new_text)
+
+    def _split_trailing_partial(self, text: str) -> Tuple[str, str]:
+        """Hold back a partial of any of the three closers, not just the bound one: the
+        effort level is unknown until a complete closer arrives."""
+        best = 0
+        for tok in (*self.THINK_ENDS, self.TOOL_START):
+            for k in range(min(len(tok) - 1, len(text)), best, -1):
+                if text.endswith(tok[:k]):
+                    best = k
+                    break
+        if best == 0:
+            return text, ""
+        return text[:-best], text[-best:]
+
+
 class MiniMaxM3ReasoningParser(BaseReasoningParser):
     """Reasoning parser for MiniMax-M3's ``<mm:think>...</mm:think>`` protocol.
 
@@ -880,6 +932,7 @@ class ReasoningParser:
         "glm": ThinkReasoningParser,
         "minimax": ThinkReasoningParser,
         "minimax_m3": MiniMaxM3ReasoningParser,
+        "k2_horizon": K2HorizonReasoningParser,
         "muse_glimmer": MuseGlimmerReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
     }

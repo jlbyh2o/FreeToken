@@ -106,6 +106,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3MoeForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
     ),
+    # K2-Horizon: MoVA attention routes the value projection over resident value-experts,
+    # so v_experts probes its own first expert the way the routed MLP experts do.
+    "K2HorizonForCausalLM": ModelSpec(
+        "freetoken.models.k2_horizon",
+        "K2HorizonForCausalLM",
+        packed_modules_mapping=_EXPERTS_PACKED + (("v_experts", ("v_experts.0",)),),
+    ),
     # Qwen3-VL: the Qwen3 text tower under model.language_model. plus the shared Qwen VL vision tower with DeepStack; the MoE variant ships its experts pre-stacked.
     "Qwen3VLForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_vl",
