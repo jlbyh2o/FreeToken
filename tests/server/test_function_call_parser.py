@@ -343,3 +343,20 @@ def test_streaming_support_flags():
     # test_streaming_model_matrix.py::test_non_streaming_detector_falls_back_to_buffered_parse).
     for name in SUPPORTED_TOOL_CALL_PARSERS:
         assert FunctionCallParser(TOOLS, tool_call_parser=name).supports_streaming() is True
+
+
+def test_every_detector_opener_is_in_the_serving_gate():
+    """``_parse_tool_response`` skips the parser entirely unless the raw text contains a
+    tag from ``TOOLS_TAG_LIST``, so a detector whose opener is missing from that list
+    never runs: the model emits a perfectly good tool call and the server hands it back
+    as ordinary content. Nothing links the two tables, hence this check."""
+    from freetoken.server.function_call_parser import TOOLS_TAG_LIST
+
+    for name in SUPPORTED_TOOL_CALL_PARSERS:
+        detector = FunctionCallParser(TOOLS, tool_call_parser=name).detector
+        opener = detector.toolcall_opener or detector.bot_token
+        if not opener:
+            continue  # composite multi-piece openers (gpt-oss, dsv4) gate on their own tags
+        assert any(tag in opener or opener in tag for tag in TOOLS_TAG_LIST), (
+            f"{name}: opener {opener!r} matches no entry in TOOLS_TAG_LIST"
+        )
